@@ -1,5 +1,5 @@
 import streamlit as st
-import mysql.connector
+import sqlite3
 import pandas as pd
 import requests
 import re
@@ -7,20 +7,13 @@ import bcrypt
 from streamlit_lottie import st_lottie
 
 # -------------------- CONFIG --------------------
-DB_CONFIG = {
-    'user': 'root',
-    'password': 'timple1972',
-    'host': 'localhost',
-    'port': 3306,
-    'database': 'clinicdb_v3'
-}
+DB_PATH = "clinicdb_v3.sqlite"
 
 # -------------------- UTILS --------------------
-def get_db(no_db: bool = False):
-    cfg = DB_CONFIG.copy()
-    if no_db:
-        cfg.pop('database')
-    return mysql.connector.connect(**cfg)
+def get_db():
+    """Open a connection to the SQLite database."""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    return conn
 
 def loti(url: str):
     r = requests.get(url)
@@ -28,55 +21,57 @@ def loti(url: str):
 
 # -------------------- DB SETUP --------------------
 def init_db():
-    db = get_db(no_db=True)
-    cur = db.cursor()
-    cur.execute("CREATE DATABASE IF NOT EXISTS clinicdb_v3")
-    cur.close()
-    db.close()
-
     db = get_db()
     cur = db.cursor()
-    cur.execute("USE clinicdb_v3")
 
+    # users table
     cur.execute("""
       CREATE TABLE IF NOT EXISTS users (
-        username VARCHAR(50) PRIMARY KEY,
-        password_hash VARBINARY(60) NOT NULL,
-        role VARCHAR(20) NOT NULL DEFAULT 'user'
-      )""")
+        username      TEXT    PRIMARY KEY,
+        password_hash BLOB    NOT NULL,
+        role          TEXT    NOT NULL DEFAULT 'user'
+      )
+    """)
 
+    # patients table
     cur.execute("""
       CREATE TABLE IF NOT EXISTS patients (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        name VARCHAR(255) NOT NULL,
-        age INT,
-        contact VARCHAR(50) UNIQUE,
-        address VARCHAR(255),
-        date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        email VARCHAR(255),
-        doctor_name VARCHAR(255),
-        disease VARCHAR(255),
-        fee INT,
-        cnic VARCHAR(20)
-      )""")
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        name          TEXT    NOT NULL,
+        age           INTEGER,
+        contact       TEXT    UNIQUE,
+        address       TEXT,
+        date_added    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        email         TEXT,
+        doctor_name   TEXT,
+        disease       TEXT,
+        fee           INTEGER,
+        cnic          TEXT
+      )
+    """)
+
+    # appointments table
     cur.execute("""
       CREATE TABLE IF NOT EXISTS appointments (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        patient_id INT,
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        patient_id       INTEGER,
         appointment_date DATE,
         appointment_time TIME,
-        doctor_name VARCHAR(255),
-        notes TEXT,
+        doctor_name      TEXT,
+        notes            TEXT,
         FOREIGN KEY (patient_id) REFERENCES patients(id) ON DELETE CASCADE
-      )""")
+      )
+    """)
+
     db.commit()
 
+    # seed an admin user if none exists
     cur.execute("SELECT 1 FROM users WHERE username='admin'")
-    if not cur.fetchone():
+    if cur.fetchone() is None:
         pw = b"admin123"
         h  = bcrypt.hashpw(pw, bcrypt.gensalt())
         cur.execute(
-            "INSERT INTO users (username, password_hash, role) VALUES (%s,%s,%s)",
+            "INSERT INTO users(username,password_hash,role) VALUES (?,?,?)",
             ("admin", h, "admin")
         )
         db.commit()
@@ -95,7 +90,7 @@ def login_form():
         db  = get_db()
         cur = db.cursor()
         cur.execute(
-            "SELECT password_hash, role FROM users WHERE username=%s",
+            "SELECT password_hash, role FROM users WHERE username=?",
             (username,)
         )
         row = cur.fetchone()
@@ -115,20 +110,21 @@ def valid_email(e):   return re.fullmatch(r"[^@]+@[^@]+\.[^@]+", e)
 # -------------------- PATIENT CRUD --------------------
 def insert_patient_record(db, name, age, contact, email, address, disease, fee, cnic):
     cur = db.cursor()
-    cur.execute("USE clinicdb_v3")
     cur.execute("""
       INSERT INTO patients
         (name, age, contact, email, address, disease, fee, cnic, doctor_name)
-      VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+      VALUES (?,?,?,?,?,?,?,?,?)
     """, (name, age, contact, email, address, disease, fee, cnic, st.session_state.user))
     db.commit()
     cur.close()
 
 def fetch_all_patients(db):
     cur = db.cursor()
-    cur.execute("USE clinicdb_v3")
     if st.session_state.role == "doctor":
-        cur.execute("SELECT * FROM patients WHERE doctor_name=%s", (st.session_state.user,))
+        cur.execute(
+            "SELECT * FROM patients WHERE doctor_name=?",
+            (st.session_state.user,)
+        )
     else:
         cur.execute("SELECT * FROM patients")
     rows = cur.fetchall()
@@ -141,8 +137,10 @@ def update_patient_record(db):
     if st.button("Search Patient"):
         fmap = {"ID":"id","Contact":"contact","CNIC":"cnic"}
         cur = db.cursor()
-        cur.execute("USE clinicdb_v3")
-        cur.execute(f"SELECT * FROM patients WHERE {fmap[option]}=%s", (value,))
+        cur.execute(
+            f"SELECT * FROM patients WHERE {fmap[option]} = ?",
+            (value,)
+        )
         patient = cur.fetchone()
         cur.close()
         if patient:
@@ -166,50 +164,49 @@ def edit_patient(db):
     new_address = st.text_input("New Address",  p[4])
     if st.button("Update"):
         cur = db.cursor()
-        cur.execute("USE clinicdb_v3")
         cur.execute("""
           UPDATE patients SET
-            name=%s, age=%s, contact=%s,
-            email=%s, address=%s
-          WHERE id=%s
+            name=?, age=?, contact=?, email=?, address=?
+          WHERE id=?
         """, (new_name,new_age,new_contact,new_email,new_address,p[0]))
         db.commit()
         st.success("Updated")
         del st.session_state.edit_patient
+        cur.close()
 
 def delete_patient_record(db, field, value):
     fmap = {"ID":"id","Name":"name","Contact":"contact"}
     cur = db.cursor()
-    cur.execute("USE clinicdb_v3")
-    cur.execute(f"DELETE FROM patients WHERE {fmap[field]}=%s", (value,))
+    cur.execute(
+        f"DELETE FROM patients WHERE {fmap[field]} = ?",
+        (value,)
+    )
     db.commit()
     cur.close()
 
 # -------------------- APPOINTMENTS --------------------
 def insert_appointment_record(db, pid, date, time, doc, notes):
     cur = db.cursor()
-    cur.execute("USE clinicdb_v3")
     cur.execute("""
       INSERT INTO appointments
         (patient_id,appointment_date,appointment_time,doctor_name,notes)
-      VALUES (%s,%s,%s,%s,%s)
-    """, (pid,date,time,doc,notes))
+      VALUES (?,?,?,?,?)
+    """, (pid, date, time, doc, notes))
     db.commit()
     cur.close()
 
 def fetch_all_appointments(db):
     cur = db.cursor()
-    cur.execute("USE clinicdb_v3")
     if st.session_state.role == "doctor":
         cur.execute("""
           SELECT id,patient_id,appointment_date,
-            CAST(appointment_time AS CHAR),doctor_name,notes
-          FROM appointments WHERE doctor_name=%s
+            appointment_time,doctor_name,notes
+          FROM appointments WHERE doctor_name=?
         """, (st.session_state.user,))
     else:
         cur.execute("""
           SELECT id,patient_id,appointment_date,
-            CAST(appointment_time AS CHAR),doctor_name,notes
+            appointment_time,doctor_name,notes
           FROM appointments
         """)
     rows = cur.fetchall()
@@ -222,17 +219,17 @@ def search_appointment(db):
     if st.button("Search"):
         fmap = {"ID":"id","Patient ID":"patient_id","Doctor Name":"doctor_name"}
         cur = db.cursor()
-        cur.execute("USE clinicdb_v3")
         cur.execute(f"""
           SELECT id,patient_id,appointment_date,
-            CAST(appointment_time AS CHAR),doctor_name,notes
-          FROM appointments WHERE {fmap[opt]}=%s
+            appointment_time,doctor_name,notes
+          FROM appointments WHERE {fmap[opt]} = ?
         """, (val,))
         row = cur.fetchone()
         cur.close()
         if row:
-            st.dataframe(pd.DataFrame([row],
-              columns=['ID','Patient ID','Date','Time','Doctor','Notes']))
+            st.dataframe(pd.DataFrame([row], columns=[
+              'ID','Patient ID','Date','Time','Doctor','Notes'
+            ]))
         else:
             st.warning("Not found")
 
@@ -245,7 +242,8 @@ def main():
         st.session_state.user = ""
         st.session_state.role = ""
 
-    db = init_db()
+    # ensure DB + tables exist
+    init_db()
 
     if not st.session_state.authenticated:
         login_form()
@@ -264,17 +262,13 @@ def main():
 
     role = st.session_state.role
     menu = ["Home"]
-
     if role in ["admin", "receptionist"]:
         menu += [
             "Add Patient", "Show Patients", "Search/Edit Patient", "Delete Patient",
             "Add Appointment", "Show Appointments", "Search/Edit Appointment"
         ]
-    elif role == "doctor":
+    else:
         menu += ["Show Patients", "Show Appointments"]
-    elif role == "user":
-        menu += ["Show Patients", "Show Appointments"]
-
     if role == "admin":
         menu.append("Manage Users")
 
@@ -288,18 +282,18 @@ def main():
         st.subheader("Add Patient")
         st_lottie(l2, height=200)
         name    = st.text_input("Name")
-        age     = st.number_input("Age",min_value=0)
+        age     = st.number_input("Age", min_value=0)
         contact = st.text_input("Contact")
         cnic    = st.text_input("CNIC")
         email   = st.text_input("Email")
         address = st.text_input("Address")
         disease = st.text_input("Disease")
-        fee     = st.number_input("Fee",min_value=0)
+        fee     = st.number_input("Fee", min_value=0)
         if st.button("Add"):
             if not valid_contact(contact) or not valid_cnic(cnic) or not valid_email(email):
                 st.warning("Enter valid contact/CNIC/email")
             else:
-                insert_patient_record(conn,name,age,contact,email,address,disease,fee,cnic)
+                insert_patient_record(conn, name, age, contact, email, address, disease, fee, cnic)
                 st.success("Patient added")
 
     elif choice == "Show Patients":
@@ -324,19 +318,19 @@ def main():
             st.success("Deleted")
 
     elif choice == "Add Appointment":
-        pid  = st.number_input("Patient ID",min_value=1)
-        date = st.date_input("Date")
-        time = st.time_input("Time")
-        doc  = st.text_input("Doctor")
-        notes= st.text_area("Notes")
+        pid   = st.number_input("Patient ID", min_value=1)
+        date  = st.date_input("Date")
+        time  = st.time_input("Time")
+        doc   = st.text_input("Doctor")
+        notes = st.text_area("Notes")
         if st.button("Add Appointment"):
-            insert_appointment_record(conn,pid,date,time,doc,notes)
+            insert_appointment_record(conn, pid, date, time, doc, notes)
             st.success("Added")
 
     elif choice == "Show Appointments":
         rows = fetch_all_appointments(conn)
         if rows:
-            df = pd.DataFrame(rows,columns=[
+            df = pd.DataFrame(rows, columns=[
                 'ID','Patient ID','Date','Time','Doctor','Notes'
             ])
             st.dataframe(df)
@@ -348,23 +342,23 @@ def main():
 
     elif choice == "Manage Users":
         st.subheader("Manage Users (Admin only)")
-        new_u = st.text_input("New Username")
-        new_pw= st.text_input("New Password",type="password")
-        conf  = st.text_input("Confirm Pw",type="password")
+        new_u    = st.text_input("New Username")
+        new_pw   = st.text_input("New Password", type="password")
+        conf     = st.text_input("Confirm Pw",      type="password")
         new_role = st.selectbox("Select Role", ["admin", "doctor", "receptionist", "user"])
         if st.button("Create User"):
             if new_pw != conf:
                 st.error("Passwords differ")
             else:
                 cur = conn.cursor()
-                cur.execute("SELECT 1 FROM users WHERE username=%s",(new_u,))
+                cur.execute("SELECT 1 FROM users WHERE username=?", (new_u,))
                 if cur.fetchone():
-                    st.warning("Exists")
+                    st.warning("User already exists")
                 else:
                     h = bcrypt.hashpw(new_pw.encode(), bcrypt.gensalt())
                     cur.execute(
-                      "INSERT INTO users (username,password_hash,role) VALUES (%s,%s,%s)",
-                      (new_u,h,new_role)
+                      "INSERT INTO users(username,password_hash,role) VALUES (?,?,?)",
+                      (new_u, h, new_role)
                     )
                     conn.commit()
                     st.success(f"User '{new_u}' with role '{new_role}' created ✅")
